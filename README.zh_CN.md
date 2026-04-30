@@ -317,6 +317,9 @@ docker run --name new-api -d --restart always \
 | `SQL_DSN` | 数据库连接字符串                                                     | - |
 | `REDIS_CONN_STRING` | Redis 连接字符串                                                  | - |
 | `STREAMING_TIMEOUT` | 流式超时时间（秒）                                                    | `300` |
+| `CHAT_COMPLETIONS_N_FANOUT_ENABLED` | Chat Completions `n > 1` 上游不支持时，是否由 New API 并发请求并聚合多个候选回复 | `true` |
+| `CHAT_COMPLETIONS_N_FANOUT_MAX_CHOICES` | Chat Completions `n` 并发聚合最大候选数，防止客户端请求过大导致上游并发过高 | `8` |
+| `CHAT_COMPLETIONS_N_FANOUT_SELF_BASE_URL` | `n` 并发聚合子请求回调当前 New API 的基础地址，容器/反代环境建议设为 `http://127.0.0.1:3000` | - |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | 流式扫描器单行最大缓冲（MB），图像生成等超大 `data:` 片段（如 4K 图片 base64）需适当调大 | `64` |
 | `MAX_REQUEST_BODY_MB` | 请求体最大大小（MB，**解压后**计；防止超大请求/zip bomb 导致内存暴涨），超过将返回 `413` | `32` |
 | `AZURE_DEFAULT_API_VERSION` | Azure API 版本                                                 | `2025-04-01-preview` |

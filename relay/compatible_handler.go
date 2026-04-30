@@ -36,6 +36,15 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		return types.NewError(fmt.Errorf("failed to copy request to GeneralOpenAIRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
+	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
+		info.RelayFormat == types.RelayFormatOpenAI &&
+		c.GetHeader("X-NewAPI-Multi-Choice-Child") == "" {
+		handled, newApiErr := maybeEmulateChatCompletionChoices(c, request)
+		if handled || newApiErr != nil {
+			return newApiErr
+		}
+	}
+
 	if request.WebSearchOptions != nil {
 		c.Set("chat_completion_web_search_context_size", request.WebSearchOptions.SearchContextSize)
 	}
