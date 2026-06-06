@@ -150,45 +150,77 @@ func emulateStreamChoices(c *gin.Context, request *dto.GeneralOpenAIRequest, n i
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 
-	responses := make([]*http.Response, n)
-	for i := 0; i < n; i++ {
-		body, err := buildChoiceRequestBody(request, true, i)
-		if err != nil {
-			closeResponses(responses)
-			return types.NewOpenAIError(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest)
-		}
-
-		resp, err := doSelfChatCompletionRequest(ctx, c, body)
-		if err != nil {
-			closeResponses(responses)
-			return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway)
-		}
-		if resp.StatusCode != http.StatusOK {
-			responseBody, _ := io.ReadAll(resp.Body)
-			service.CloseResponseBodyGracefully(resp)
-			closeResponses(responses)
-			return types.NewOpenAIError(fmt.Errorf("choice %d upstream status %d: %s", i, resp.StatusCode, strings.TrimSpace(string(responseBody))), types.ErrorCodeBadResponse, http.StatusBadGateway)
-		}
-		responses[i] = resp
+	type streamOpenResult struct {
+		choiceIndex int
+		resp        *http.Response
+		err         error
 	}
 
-	helper.SetEventStreamHeaders(c)
-
-	var writeMu sync.Mutex
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(n)
+	openResults := make(chan streamOpenResult, n)
 	for i := 0; i < n; i++ {
 		i := i
-		resp := responses[i]
-		g.Go(func() error {
-			defer service.CloseResponseBodyGracefully(resp)
-			return forwardChoiceStream(c, resp.Body, i, &writeMu)
-		})
+		go func() {
+			body, err := buildChoiceRequestBody(request, true, i)
+			if err != nil {
+				openResults <- streamOpenResult{choiceIndex: i, err: err}
+				return
+			}
+
+			resp, err := doSelfChatCompletionRequest(ctx, c, body)
+			if err != nil {
+				openResults <- streamOpenResult{choiceIndex: i, err: err}
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				responseBody, _ := io.ReadAll(resp.Body)
+				service.CloseResponseBodyGracefully(resp)
+				openResults <- streamOpenResult{choiceIndex: i, err: fmt.Errorf("choice %d upstream status %d: %s", i, resp.StatusCode, strings.TrimSpace(string(responseBody)))}
+				return
+			}
+			openResults <- streamOpenResult{choiceIndex: i, resp: resp}
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		common.SysError("multi-choice stream fan-out error: " + err.Error())
+	var writeMu sync.Mutex
+	var headersOnce sync.Once
+	var forwardWG sync.WaitGroup
+	var firstErr error
+	successes := 0
+
+	for opened := 0; opened < n; opened++ {
+		result := <-openResults
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			logger.LogWarn(c, "multi-choice stream fan-out child failed: "+result.err.Error())
+			continue
+		}
+
+		successes++
+		forwardWG.Add(1)
+		go func(result streamOpenResult) {
+			defer forwardWG.Done()
+			defer service.CloseResponseBodyGracefully(result.resp)
+			headersOnce.Do(func() {
+				writeMu.Lock()
+				helper.SetEventStreamHeaders(c)
+				writeMu.Unlock()
+			})
+			if err := forwardChoiceStream(c, result.resp.Body, result.choiceIndex, &writeMu); err != nil {
+				logger.LogWarn(c, fmt.Sprintf("multi-choice stream fan-out choice %d forward error: %v", result.choiceIndex, err))
+			}
+		}(result)
 	}
+
+	if successes == 0 {
+		if firstErr == nil {
+			firstErr = fmt.Errorf("all multi-choice stream fan-out children failed")
+		}
+		return types.NewOpenAIError(firstErr, types.ErrorCodeBadResponse, http.StatusBadGateway)
+	}
+
+	forwardWG.Wait()
 
 	writeMu.Lock()
 	helper.Done(c)

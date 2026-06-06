@@ -1,14 +1,20 @@
 package relay
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -85,6 +91,91 @@ func TestForwardChoiceStreamRewritesChoiceIndex(t *testing.T) {
 	}
 	if !strings.Contains(body, "hello") {
 		t.Fatalf("stream output lost content: %s", body)
+	}
+}
+
+func TestEmulateStreamChoicesStreamsFastChoiceBeforeSlowFailingChoice(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read child body: %v", err)
+		}
+		var child dto.GeneralOpenAIRequest
+		if err := common.Unmarshal(raw, &child); err != nil {
+			t.Fatalf("unmarshal child body: %v", err)
+		}
+		seed := 0.0
+		if child.Seed != nil {
+			seed = *child.Seed
+		}
+
+		if seed == 43 {
+			time.Sleep(350 * time.Millisecond)
+			http.Error(w, "slow choice failed", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `data: {"id":"child-fast","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"fast"},"finish_reason":null}]}`)
+		fmt.Fprintln(w)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		fmt.Fprintln(w, `data: [DONE]`)
+		fmt.Fprintln(w)
+	}))
+	defer childServer.Close()
+	t.Setenv(multiChoiceFanoutSelfBaseEnv, childServer.URL)
+	t.Setenv(legacyMultiChoiceSelfBaseEnv, "")
+
+	router := gin.New()
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		n := 2
+		stream := true
+		seed := 42.0
+		err := emulateStreamChoices(c, &dto.GeneralOpenAIRequest{
+			Model:  "test-model",
+			N:      &n,
+			Stream: &stream,
+			Seed:   &seed,
+		}, n)
+		if err != nil {
+			status := err.StatusCode
+			if status == 0 {
+				status = http.StatusBadGateway
+			}
+			c.String(status, err.Error())
+		}
+	})
+	outerServer := httptest.NewServer(router)
+	defer outerServer.Close()
+
+	start := time.Now()
+	resp, err := http.Post(outerServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatalf("post outer stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("outer status = %d, want 200, body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first stream line: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("first stream line took %s, want under 200ms; line=%s", elapsed, line)
+	}
+	if !strings.Contains(line, `"index":0`) || !strings.Contains(line, "fast") {
+		t.Fatalf("unexpected first stream line: %s", line)
 	}
 }
 
